@@ -1268,6 +1268,41 @@ impl RenderableReport {
         out.push('\n');
         out
     }
+
+    /// Render this report as GitHub Actions workflow annotations.
+    ///
+    /// Emits one `::error::`, `::warning::`, or `::notice::` command per
+    /// finding (suppressed findings are always `::notice::`), followed by a
+    /// summary line. This produces the same output as the main command's
+    /// `--format github-actions` for the same analysis, so a stored JSON
+    /// report can be turned into annotations without re-running the analysis.
+    pub fn to_github_actions(&self) -> String {
+        use crate::diff::Severity;
+        let mut output = String::new();
+        for (category, findings) in &self.findings_by_category {
+            for reported in findings {
+                let level = if reported.suppressed() {
+                    "notice"
+                } else {
+                    match reported.finding().severity() {
+                        Severity::Critical => "error",
+                        Severity::Warning => "warning",
+                        Severity::Info => "notice",
+                    }
+                };
+                let message = reported
+                    .finding()
+                    .message()
+                    .replace(['\r', '\n'], " ");
+                output.push_str(&format!("::{level}::[{category}] {message}\n"));
+            }
+        }
+        output.push_str(&format!(
+            "Soroban Upgrade Safeguard: {}\n",
+            if self.is_safe { "PASSED" } else { "FAILED" }
+        ));
+        output
+    }
 }
 
 /// Minimal view used to read the schema version before full deserialization.
