@@ -371,6 +371,8 @@ enum RenderFormat {
     Text,
     /// Markdown document suitable for PR descriptions and comments.
     Markdown,
+    /// GitHub Actions workflow annotations (::error::, ::warning::, ::notice::).
+    GithubActions,
 }
 
 #[derive(Parser, Debug)]
@@ -740,6 +742,8 @@ enum Command {
     Lint(LintArgs),
     /// Validate RPC connectivity and JSON-RPC protocol shape without fetching contract code
     Preflight(PreflightArgs),
+    /// Minimize a failing fuzz input and promote it to a deterministic fixture
+    FuzzMinimize(FuzzMinimizeArgs),
 }
 
 /// `lint`: validate a single decoded contract spec (and optional storage
@@ -785,6 +789,11 @@ struct LintArgs {
     /// Maximum recursive type-walk depth. Overrides the built-in default.
     #[arg(long, value_name = "N")]
     max_walk_depth: Option<usize>,
+
+    /// Write the lint result to PATH instead of stdout. Written atomically
+    /// (temp file + rename); the exit code is unchanged.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 
     #[arg(long)]
     no_color: bool,
@@ -844,7 +853,54 @@ struct VerifyAttestationArgs {
     policy_expires_at: Option<u64>,
 }
 
-/// `stream`: JSON Lines streaming batch mode.
+/// `stream`: JSON Lines (JSONL) streaming batch mode.
+///
+/// Reads one JSON job per line from stdin and writes one JSON result per line
+/// to stdout. Diagnostics go to stderr. All job and result objects carry a
+/// `schema_version` field (currently always `1`).
+///
+/// # Job line (one per stdin line)
+///
+/// ```json
+/// {"schema_version":1,"id":"job-42","old":{"local":"/path/to/old.wasm"},"new":{"local":"/path/to/new.wasm"},"overrides":{"strict":true}}
+/// ```
+///
+/// Required fields: `schema_version`, `id`, `old`, `new`.
+/// Optional: `overrides` (per-job `strict`, `explain`, `ascii`, `empirical`,
+/// `suppression_config`).
+///
+/// # Result line (one per job, written to stdout)
+///
+/// ```json
+/// {"schema_version":1,"id":"job-42","status":"success","report":{...},"elapsed_ms":123}
+/// ```
+///
+/// `report` is present on `success`; `error` is present on `failure`,
+/// `duplicate`, and `malformed`.
+///
+/// # Status values
+///
+/// | Value       | Meaning                                                  |
+/// |-------------|----------------------------------------------------------|
+/// | `success`   | Job processed; `report` contains the analysis result.   |
+/// | `failure`   | Input loading or WASM parsing failed; see `error`.       |
+/// | `duplicate` | Job `id` was already seen; job was skipped.              |
+/// | `malformed` | The job line was not valid JSON or violated the schema.  |
+///
+/// # Input descriptors
+///
+/// Every `old` / `new` value is a **single-key object** that selects exactly
+/// one of the five supported sources:
+///
+/// | Key         | Example value                                              |
+/// |-------------|------------------------------------------------------------|
+/// | `local`     | `{"local":"/path/to/file.wasm"}`                           |
+/// | `rpc`       | `{"rpc":{"url":"https://…","contract_id":"C…"}}`           |
+/// | `hash`      | `{"hash":{"path":"/path/to/file.wasm","sha256":"hex…"}}`   |
+/// | `extracted` | `{"extracted":"/path/to/spec.json"}`                       |
+/// | `remote`    | `{"remote":"https://…#sha256=hex"}`                        |
+///
+/// See `src/jsonl.rs` for the full wire-format documentation.
 #[derive(ClapArgs, Debug)]
 struct StreamArgs {
     /// Maximum number of concurrent worker threads.
@@ -920,6 +976,11 @@ struct ExtractArgs {
     /// Omit interface scope information (the `scope` field) from the output.
     #[arg(long)]
     no_scope: bool,
+
+    /// Print the JSON on a single line (compact) instead of pretty-printed.
+    /// Useful for piping into other tools or storing in single-line archives.
+    #[arg(long)]
+    compact: bool,
 }
 
 /// `lockfile`: write a committed snapshot of one contract's exported interface.
@@ -1009,6 +1070,40 @@ struct InitArgs {
 
     #[arg(long = "rpc-header", value_name = "NAME=ENV_VAR")]
     rpc_headers: Vec<String>,
+}
+
+/// `fuzz-minimize`: minimize a failing fuzz input and promote it to a fixture.
+#[derive(ClapArgs, Debug)]
+struct FuzzMinimizeArgs {
+    /// Path to the failing input to minimize.
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    /// The kind of input: parser, decoder, mapper, or report.
+    #[arg(long, value_name = "KIND", default_value = "parser")]
+    kind: String,
+
+    /// Directory to write the promoted fixture into. Created if absent.
+    #[arg(long, value_name = "DIR", default_value = "fuzz/fixtures")]
+    output_dir: PathBuf,
+
+    /// Maximum number of reduction iterations (default: 1 000).
+    #[arg(long, value_name = "N", default_value_t = 1_000)]
+    max_iterations: usize,
+
+    /// Record every attempted reduction step in the metadata, not just
+    /// accepted ones. Produces larger metadata files.
+    #[arg(long)]
+    verbose_history: bool,
+
+    /// Print the minimization result as JSON instead of human-readable text.
+    #[arg(long)]
+    json: bool,
+
+    /// Minimize only — do not promote to a fixture. Prints the minimized
+    /// bytes to stdout (binary safe).
+    #[arg(long, conflicts_with = "output_dir")]
+    no_promote: bool,
 }
 
 /// `preflight`: validate RPC connectivity and protocol shape only.
@@ -1109,10 +1204,12 @@ fn run_extract(args: &ExtractArgs) -> Result<()> {
             object.remove("scope");
         }
     }
-    write_extract_output(
-        args.output.as_deref(),
-        &serde_json::to_string_pretty(&value)?,
-    )
+    let json = if args.compact {
+        serde_json::to_string(&value)?
+    } else {
+        serde_json::to_string_pretty(&value)?
+    };
+    write_extract_output(args.output.as_deref(), &json)
 }
 
 /// Print `content` to stdout, or write it atomically to `path` when given —
@@ -1403,12 +1500,23 @@ fn run_lint(args: &LintArgs) -> Result<()> {
 
     let report = lint::lint(&metadata.spec, &options);
 
-    match args.format {
-        LintOutputFormat::Text => print!("{}", report.render_text(args.explain)),
-        LintOutputFormat::Markdown => print!("{}", report.render_markdown(args.explain)),
+    let output_text = match args.format {
+        LintOutputFormat::Text => report.render_text(args.explain),
+        LintOutputFormat::Markdown => report.render_markdown(args.explain),
         LintOutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(&report.to_json_value())?)
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&report.to_json_value())?
+            )
         }
+    };
+
+    match &args.output {
+        Some(path) => {
+            write_atomically(path, output_text.as_bytes())
+                .with_context(|| format!("Failed to write lint output to '{}'.", path.display()))?;
+        }
+        None => print!("{output_text}"),
     }
 
     if report.has_errors() {
@@ -1705,6 +1813,9 @@ fn run_render(args: &RenderArgs) -> Result<()> {
                 }
             );
         }
+        RenderFormat::GithubActions => {
+            print!("{}", report.to_github_actions());
+        }
     }
 
     if !report.is_safe {
@@ -1918,6 +2029,90 @@ fn run_init(args: &InitArgs) -> Result<()> {
     Ok(())
 }
 
+/// Minimize a failing fuzz input and optionally promote it to a fixture.
+fn run_fuzz_minimize(args: &FuzzMinimizeArgs) -> Result<()> {
+    use soroban_upgrade_safeguard::fuzz_minimize::{minimize, promote, InputKind, MinimizeConfig};
+
+    let kind = match args.kind.as_str() {        "parser" => InputKind::Parser,
+        "decoder" => InputKind::Decoder,
+        "mapper" => InputKind::Mapper,
+        "report" => InputKind::Report,
+        other => anyhow::bail!(
+            "Unknown input kind '{}'. Supported: parser, decoder, mapper, report.",
+            other
+        ),
+    };
+
+    let input = std::fs::read(&args.input).with_context(|| {
+        format!("Failed to read input file '{}'", args.input.display())
+    })?;
+
+    let config = MinimizeConfig {
+        input_kind: kind,
+        max_iterations: args.max_iterations,
+        verbose_history: args.verbose_history,
+        ..MinimizeConfig::default()
+    };
+
+    eprintln!(
+        "Minimizing {} byte {} input (max {} iterations)…",
+        input.len(),
+        kind,
+        args.max_iterations
+    );
+
+    let result = minimize(&input, &config).with_context(|| {
+        format!(
+            "Minimization failed for '{}'. The input may not trigger a failure.",
+            args.input.display()
+        )
+    })?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    eprintln!(
+        "✅ Minimized {} → {} bytes in {} steps ({} accepted).",
+        result.original_len, result.minimized_len, result.steps_attempted, result.steps_accepted
+    );
+    eprintln!("   Failure class : {}", result.failure_class);
+    eprintln!("   SHA-256 digest: {}", result.digest);
+
+    if args.no_promote {
+        use std::io::Write;
+        std::io::stdout()
+            .write_all(&result.minimized_bytes)
+            .context("Failed to write minimized bytes to stdout")?;
+        return Ok(());
+    }
+
+    let fixture = promote(result, &args.output_dir).with_context(|| {
+        format!(
+            "Failed to promote fixture to '{}'",
+            args.output_dir.display()
+        )
+    })?;
+
+    eprintln!("📦 Promoted fixture: {}", fixture.name);
+    for note in &fixture.validation_notes {
+        eprintln!("   {note}");
+    }
+    eprintln!(
+        "   {}/{}.bin",
+        args.output_dir.display(),
+        fixture.name
+    );
+    eprintln!(
+        "   {}/{}.meta.json",
+        args.output_dir.display(),
+        fixture.name
+    );
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -1960,6 +2155,7 @@ fn main() -> Result<()> {
         Some(Command::Stream(stream_args)) => return run_stream(stream_args),
         Some(Command::Lint(lint_args)) => return run_lint(lint_args),
         Some(Command::Preflight(preflight_args)) => return run_preflight(preflight_args),
+        Some(Command::FuzzMinimize(fuzz_args)) => return run_fuzz_minimize(fuzz_args),
         None => {}
     }
 
