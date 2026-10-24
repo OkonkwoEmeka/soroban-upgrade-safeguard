@@ -337,6 +337,7 @@ fn rpc_fetch_compares_on_chain_against_local() {
             "--rpc-url",
             &format!("http://{}", addr),
         ])
+        .arg("--allow-http-local")
         .arg(wasm_fixture("v2.wasm"))
         .args(["--format", "json"])
         .output()
@@ -379,6 +380,7 @@ fn rpc_fetch_safe_comparison() {
             "--rpc-url",
             &format!("http://{}", addr),
         ])
+        .arg("--allow-http-local")
         .arg(wasm_fixture("v1.wasm")) // same as on-chain
         .args(["--format", "json"])
         .output()
@@ -403,6 +405,7 @@ fn rpc_fetch_contract_not_found_produces_clear_error() {
             "--rpc-url",
             &format!("http://{}", addr),
         ])
+        .arg("--allow-http-local")
         .arg(wasm_fixture("v1.wasm"))
         .output()
         .expect("failed to run binary");
@@ -427,6 +430,7 @@ fn rpc_fetch_network_failure_produces_clear_error() {
             "--rpc-url",
             "http://127.0.0.1:1", // almost certainly nobody is listening here
         ])
+        .arg("--allow-http-local")
         .arg(wasm_fixture("v1.wasm"))
         .output()
         .expect("failed to run binary");

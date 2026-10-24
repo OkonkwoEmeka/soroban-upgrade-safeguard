@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! JSON Lines (JSONL) streaming batch protocol.
 //!
 //! Reads one versioned JSON job per line from standard input and writes one
@@ -243,7 +245,7 @@ pub fn run_streaming<R: Read, W: Write>(
 
     // Spawn worker threads.
     let mut worker_handles = Vec::with_capacity(num_workers);
-    for worker_id in 0..num_workers {
+    for _ in 0..num_workers {
         let rx = Arc::clone(&shared_rx);
         let tx = result_tx.clone();
         let suppressions = config.suppressions.clone();
@@ -285,7 +287,6 @@ pub fn run_streaming<R: Read, W: Write>(
                 }
             }
             drop(tx);
-            eprintln!("[stream] worker {worker_id} exiting");
         });
         worker_handles.push(handle);
     }
